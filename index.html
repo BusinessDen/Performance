@@ -388,7 +388,7 @@ const PLANS = ['monthly','annual','corporate'];
 const PC = { monthly:'#4c8fc9', annual:'#c9a84c', corporate:'#a06cd5' };
 const PC_DIM = { monthly:'rgba(76,143,201,0.6)', annual:'rgba(201,168,76,0.6)', corporate:'rgba(160,108,213,0.6)' };
 
-let state = { period:'mtd', payments:null, snapshots:null, subscribers:null };
+let state = { period:'mtd', payments:null, snapshots:null, subscribers:null, usingDemo:false };
 let CH = {};
 
 Chart.defaults.color='#4a4845'; Chart.defaults.borderColor='#2a2a27';
@@ -438,34 +438,89 @@ function generateDemoData() {
 function rnd(n){return Math.floor(Math.random()*n);}
 
 // ── LOAD ─────────────────────────────────────────────────────────────────────
-async function loadData() {
-  try {
-    const BASE='https://businessden.github.io/subscriber/data';
-    const [pR,sR,subR]=await Promise.all([fetch(`${BASE}/payments.json`),fetch(`${BASE}/snapshots.json`),fetch(`${BASE}/subscribers.json`)]);
-    if(!pR.ok||!sR.ok||!subR.ok) throw new Error();
-    state.payments=await pR.json(); state.snapshots=await sR.json(); state.subscribers=await subR.json();
-    document.getElementById('data-dot').style.background='var(--green)';
-    document.getElementById('data-source-label').textContent='businessden.github.io/subscriber/data';
-  } catch {
-    const d=generateDemoData();
-    state.payments=d.payments; state.snapshots=d.snapshots; state.subscribers=d.subscribers;
-    document.getElementById('data-dot').style.background='var(--orange)';
-    document.getElementById('data-source-label').textContent='Demo data — subscriber/data/ not reachable';
-    document.getElementById('error-banner').classList.add('visible');
+// payments are stored in per-year files (payments_2020.json … payments_YYYY.json)
+// We never merge them — instead we fetch only the year(s) relevant to the
+// selected period and compute revenue totals directly from those arrays.
+
+const BASE = 'https://businessden.github.io/subscriber/data';
+
+async function fetchPaymentsForPeriod(period) {
+  const now = new Date();
+  const thisYear = now.getFullYear();
+
+  // Which years do we need?
+  let years;
+  if (period === 'mtd') {
+    years = [thisYear];                            // only current year
+  } else if (period === 'ytd') {
+    years = [thisYear];                            // only current year
+  } else {
+    // all-time: fetch from 2020 up to current year
+    years = [];
+    for (let y = 2020; y <= thisYear; y++) years.push(y);
   }
-  document.getElementById('last-updated-label').textContent='Updated '+new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
-  render();
-  setTimeout(()=>document.getElementById('loading-overlay').classList.add('hidden'),300);
+
+  // Fetch each needed year file independently, silently skip missing ones
+  const results = await Promise.all(
+    years.map(y =>
+      fetch(`${BASE}/payments_${y}.json`)
+        .then(r => r.ok ? r.json() : [])
+        .catch(() => [])
+    )
+  );
+
+  // Filter to the exact period window and return flat array
+  const flat = results.flat();
+  return flat.filter(p => {
+    if (p.status !== 'succeeded') return false;
+    const d = new Date(p.date);
+    if (period === 'mtd') return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
+    if (period === 'ytd') return d.getFullYear() === now.getFullYear();
+    return true; // all-time
+  });
 }
 
-function setPeriod(p,el){
+async function loadData() {
+  try {
+    const [sR, subR] = await Promise.all([
+      fetch(`${BASE}/snapshots.json`),
+      fetch(`${BASE}/subscribers.json`)
+    ]);
+
+    if (!sR.ok)   throw new Error('snapshots.json not found');
+    if (!subR.ok) throw new Error('subscribers.json not found');
+
+    state.snapshots   = await sR.json();
+    state.subscribers = await subR.json();
+
+    state.usingDemo = false;
+    document.getElementById('data-dot').style.background = 'var(--green)';
+    document.getElementById('data-source-label').textContent = 'businessden.github.io/subscriber/data';
+
+  } catch(e) {
+    state.usingDemo = true;
+    const d = generateDemoData();
+    state.payments = d.payments; state.snapshots = d.snapshots; state.subscribers = d.subscribers;
+    document.getElementById('data-dot').style.background = 'var(--red)';
+    document.getElementById('data-source-label').textContent = 'Demo data — subscriber/data/ unreachable';
+    const banner = document.getElementById('error-banner');
+    banner.textContent = '\u26a0 Could not load data from businessden.github.io/subscriber/data — showing demo data. Confirm GitHub Pages is enabled on BusinessDen/subscriber (Settings \u2192 Pages).';
+    banner.classList.add('visible');
+  }
+
+  document.getElementById('last-updated-label').textContent = 'Updated ' + new Date().toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit'});
+  await render();
+  setTimeout(() => document.getElementById('loading-overlay').classList.add('hidden'), 300);
+}
+
+async function setPeriod(p,el){
   state.period=p;
   document.querySelectorAll('.period-btn').forEach(b=>b.classList.remove('active'));
-  el.classList.add('active'); render();
+  el.classList.add('active'); await render();
 }
 
 // ── RENDER ───────────────────────────────────────────────────────────────────
-function render() {
+async function render() {
   const now=new Date(); const period=state.period;
   const snaps=[...state.snapshots].sort((a,b)=>a.month.localeCompare(b.month));
   const latest=snaps[snaps.length-1]||{}; const prev=snaps[snaps.length-2]||{};
@@ -485,14 +540,11 @@ function render() {
   const totalMRR=PLANS.reduce((a,p)=>a+mrrByPlan[p],0);
   const totalARR=totalMRR*12;
 
-  // Period revenue by plan
-  const filtPay=state.payments.filter(p=>{
-    if(p.status!=='succeeded')return false;
-    const d=new Date(p.date);
-    if(period==='mtd')return d.getFullYear()===now.getFullYear()&&d.getMonth()===now.getMonth();
-    if(period==='ytd')return d.getFullYear()===now.getFullYear();
-    return true;
-  });
+  // Period revenue — fetch only the year file(s) needed for the selected period,
+  // never loading the full payment history into memory at once
+  const filtPay = state.usingDemo
+    ? (state.payments||[])  // demo mode: already filtered array in state
+    : await fetchPaymentsForPeriod(period);
   const revByPlan={monthly:0,annual:0,corporate:0};
   filtPay.forEach(p=>revByPlan[p.plan]=(revByPlan[p.plan]||0)+p.amount);
   const totalPeriodRev=PLANS.reduce((a,p)=>a+revByPlan[p],0);

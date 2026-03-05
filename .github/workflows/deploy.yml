@@ -1,75 +1,57 @@
-name: Deploy Owner Dashboard
-
+name: Deploy Dashboard
 on:
-  # Deploy whenever dashboard.html (or any file) is pushed to main
   push:
-    branches:
-      - main
-
-  # Allow manual trigger from the Actions tab
-  workflow_dispatch:
-
-  # Redeploy daily at 6am MT so the page is always fresh after subscriber data updates
-  # subscriber repo runs its scraper independently; this ensures Pages cache is busted
-  # 6am MST (Nov–Mar) = 13:00 UTC
-  # 6am MDT (Mar–Nov) = 12:00 UTC
+    branches: [main]
   schedule:
+    # 6am MST (Nov-Mar) = 13:00 UTC
+    # 6am MDT (Mar-Nov) = 12:00 UTC
     - cron: '0 12 * * *'
     - cron: '0 13 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# Only one deployment at a time; if a new run starts, cancel the in-progress one
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # DST guard — only runs the scheduled job at the correct MT hour (6am)
-      # Push and workflow_dispatch always proceed regardless of hour
-      - name: Check DST (scheduled runs only)
+      - name: Check DST
         id: dst_check
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            HOUR_MT=$(TZ=America/Denver date +%H)
-            echo "Mountain Time hour: $HOUR_MT"
-            if [ "$HOUR_MT" = "06" ]; then
-              echo "skip=false" >> $GITHUB_OUTPUT
-            else
-              echo "skip=true" >> $GITHUB_OUTPUT
-              echo "Wrong hour for current DST offset — skipping"
-            fi
-          else
+          HOUR_MT=$(TZ=America/Denver date +%H)
+          echo "Mountain Time hour: $HOUR_MT"
+          if [ "$HOUR_MT" = "06" ]; then
             echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Wrong hour for current DST — skipping"
           fi
 
-      - name: Checkout repo
-        if: steps.dst_check.outputs.skip != 'true'
+      - name: Checkout
+        if: steps.dst_check.outputs.skip != 'true' || github.event_name != 'schedule'
         uses: actions/checkout@v4
-        with:
-          ref: main
 
       - name: Setup Pages
-        if: steps.dst_check.outputs.skip != 'true'
+        if: steps.dst_check.outputs.skip != 'true' || github.event_name != 'schedule'
         uses: actions/configure-pages@v4
 
-      - name: Upload Pages artifact
-        if: steps.dst_check.outputs.skip != 'true'
+      - name: Upload artifact
+        if: steps.dst_check.outputs.skip != 'true' || github.event_name != 'schedule'
         uses: actions/upload-pages-artifact@v3
         with:
           path: '.'
 
       - name: Deploy to GitHub Pages
-        if: steps.dst_check.outputs.skip != 'true'
-        id: deploy
+        if: steps.dst_check.outputs.skip != 'true' || github.event_name != 'schedule'
+        id: deployment
         uses: actions/deploy-pages@v4
